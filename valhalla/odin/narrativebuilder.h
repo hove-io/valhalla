@@ -419,8 +419,7 @@ protected:
 
   std::string FormExitBuildingInstruction(Maneuver& maneuver);
 
-  std::string FormReturnBikeAtBikeShareInstruction(Maneuver& maneuver);
-  std::string FormRentBikeAtBikeShareInstruction(Maneuver& maneuver);
+  std::string FormBikeShareInstruction(Maneuver& maneuver);
 
   std::string FormGenericLevelChangeInstruction(Maneuver& maneuver);
 

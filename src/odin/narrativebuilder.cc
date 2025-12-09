@@ -514,10 +514,10 @@ void NarrativeBuilder::Build(std::list<Maneuver>& maneuvers) {
         maneuver.set_instruction(FormGenericLevelChangeInstruction(maneuver));
         break;
       case DirectionsLeg_Maneuver_Type_kTypeRentBikeAtBikeShare:
-        maneuver.set_instruction(FormRentBikeAtBikeShareInstruction(maneuver));
+        maneuver.set_instruction(FormBikeShareInstruction(maneuver));
         break;
       case DirectionsLeg_Maneuver_Type_kTypeReturnBikeAtBikeShare:
-        maneuver.set_instruction(FormReturnBikeAtBikeShareInstruction(maneuver));
+        maneuver.set_instruction(FormBikeShareInstruction(maneuver));
         break;
       case DirectionsLeg_Maneuver_Type_kContinue:
       default: {
@@ -4333,12 +4333,11 @@ std::string NarrativeBuilder::FormEnterBuildingInstruction(Maneuver& maneuver) {
   return instruction;
 }
 
-std::string NarrativeBuilder::FormReturnBikeAtBikeShareInstruction(Maneuver& maneuver) {
-  return "Return a bike at the bike share station.";
-}
-
-std::string NarrativeBuilder::FormRentBikeAtBikeShareInstruction(Maneuver& maneuver) {
-  return "Rent a bike at the bike share station.";
+std::string NarrativeBuilder::FormBikeShareInstruction(Maneuver& maneuver) {
+  if (maneuver.type() == DirectionsLeg_Maneuver_Type_kTypeRentBikeAtBikeShare) {
+      return dictionary_.bike_share_verbal.phrases.at(std::to_string(kBikeShareRentIndex));
+  }
+  return dictionary_.bike_share_verbal.phrases.at(std::to_string(kBikeShareReturnIndex));
 }
 
 std::string NarrativeBuilder::FormExitBuildingInstruction(Maneuver& maneuver) {
