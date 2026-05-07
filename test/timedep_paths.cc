@@ -27,8 +27,6 @@ const std::unordered_map<std::string, float> kMaxDistances = {
     {"pedestrian", 7200.0f}, {"transit", 14400.0f},       {"truck", 43200.0f},
     {"taxi", 43200.0f},
 };
-// a scale factor to apply to the score so that we bias towards closer results more
-constexpr float kDistanceScale = 10.f;
 
 const auto cfg = test::make_config(VALHALLA_BUILD_DIR "test/data/utrecht_tiles");
 
@@ -40,7 +38,7 @@ void try_path(GraphReader& reader,
   Api request;
   ParseApi(test_request, Options::route, request);
   loki_worker.route(request);
-  thor_worker_t::adjust_scores(*request.mutable_options());
+  thor_worker_t::adjust_locations(request);
 
   // For now this just tests auto costing - could extend to other
   travel_mode_t mode;

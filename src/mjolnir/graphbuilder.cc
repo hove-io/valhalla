@@ -20,7 +20,7 @@
 #include "mjolnir/util.h"
 #include "scoped_timer.h"
 
-#include <boost/algorithm/string.hpp>
+#include <boost/algorithm/string/case_conv.hpp>
 #include <boost/format.hpp>
 #include <boost/property_tree/ptree.hpp>
 
@@ -39,7 +39,6 @@ namespace {
 /**
  * we need the nodes to be sorted by graphid and then by osmid to make a set of tiles
  * we also need to then update the edges that pointed to them
- *
  */
 std::map<GraphId, size_t> SortGraph(const std::string& nodes_file, const std::string& edges_file) {
   LOG_INFO("Sorting graph...");
@@ -187,13 +186,14 @@ void ConstructEdges(const std::string& ways_file,
     for (auto ni = current_way_node_index; ni <= last_way_node_index; ni++) {
       const auto wn = (*way_nodes[ni]).node;
       if (!wn.latlng().IsValid()) {
-        LOG_WARN("Node " + std::to_string(wn.osmid_) + " in way " + std::to_string(way.way_id()) +
-                 " has not had coordinates initialized");
+        LOG_DEBUG("Node " + std::to_string(wn.osmid_) + " in way " + std::to_string(way.way_id()) +
+                  " has not had coordinates initialized");
+        build_stats::get().increment(build_stats::kFailedNodeInitialization);
         valid = false;
       }
     }
     if (!valid) {
-      LOG_WARN("Do not add edge!");
+      LOG_DEBUG("Do not add edge!");
       current_way_node_index = last_way_node_index + 1;
       continue;
     }
@@ -366,7 +366,9 @@ uint32_t CreateSimpleTurnRestriction(const uint64_t wayid,
 
   // Check if mask exceeds the limit
   if (mask >= (1 << kMaxTurnRestrictionEdges)) {
-    LOG_WARN("Restrictions mask exceeds allowable limit on wayid: " + std::to_string(wayid));
+    LOG_DEBUG("Simple turn restrictions mask exceeds allowable limit on wayid: " +
+              std::to_string(wayid));
+    build_stats::get().increment(build_stats::kExceededTurnRestrictionMask);
   }
 
   // Return the restriction mask
@@ -401,6 +403,58 @@ uint32_t AddAccessRestrictions(const uint32_t edgeid,
   return modes;
 }
 
+// Computes speeds for ferries that have "duration" tag. Regardless of number of edges this ferry
+// will be split into, all of them should have the same speed.
+std::unordered_map<uint64_t, uint32_t> ComputeFerrySpeeds(const std::string& ways_file,
+                                                          const std::string& way_nodes_file) {
+  SCOPED_TIMER();
+
+  sequence<OSMWay> ways(ways_file, false);
+  sequence<OSMWayNode> way_nodes(way_nodes_file, false);
+
+  std::unordered_map<uint64_t, uint32_t> ferry_speeds;
+  size_t way_node_index = 0;
+  for (size_t way_index = 0; way_index < ways.size(); ++way_index) {
+    const auto& way = *ways[way_index];
+    if (way.ferry() && way.duration()) {
+      PointLL prev;
+      // Iterate through the way nodes until we find the first node of this way.
+      while (way_node_index < way_nodes.size()) {
+        const OSMWayNode way_node = (*way_nodes[way_node_index]);
+        if (way_node.way_index < way_index) {
+          // Ferries are rare. As there are at least 2 nodes per way, we can jump by more than 1.
+          const auto current_way_index = (*way_nodes[way_node_index]).way_index;
+          way_node_index += (way_index - current_way_index - 1) * 2 + 1;
+        } else {
+          // First iteration of the "compute length" loop as we anyway have this node.
+          prev = way_node.node.latlng();
+          way_node_index += 1;
+          break;
+        }
+      }
+
+      double length = 0.0;
+      while (way_node_index < way_nodes.size()) {
+        const OSMWayNode way_node = (*way_nodes[way_node_index]);
+        if (way_node.way_index != way_index) {
+          break;
+        }
+
+        const auto curr = way_node.node.latlng();
+        length += prev.Distance(curr);
+        prev = curr;
+        way_node_index += 1;
+      }
+
+      // convert to kph
+      const auto speed = static_cast<uint32_t>((length * 3.6) / way.duration());
+      ferry_speeds.emplace(way.way_id(), (speed == 0) ? 1 : speed);
+    }
+  }
+
+  return ferry_speeds;
+}
+
 void BuildTileSet(const std::string& ways_file,
                   const std::string& way_nodes_file,
                   const std::string& nodes_file,
@@ -413,6 +467,7 @@ void BuildTileSet(const std::string& ways_file,
                   std::queue<std::pair<GraphId, size_t>>& tiles,
                   std::mutex& tiles_lock,
                   const uint32_t tile_creation_date,
+                  const std::unordered_map<uint64_t, uint32_t>& ferry_speeds,
                   const boost::property_tree::ptree& pt,
                   std::promise<DataQuality>& result) {
 
@@ -425,8 +480,6 @@ void BuildTileSet(const std::string& ways_file,
   sequence<OSMNodeLinguistic> linguistic_node(linguistic_node_file, false);
 
   auto database = pt.get_optional<std::string>("admin");
-  bool infer_internal_intersections =
-      pt.get<bool>("data_processing.infer_internal_intersections", true);
   bool use_urban_tag = pt.get<bool>("data_processing.use_urban_tag", false);
   bool use_admin_db = pt.get<bool>("data_processing.use_admin_db", true);
 
@@ -451,18 +504,36 @@ void BuildTileSet(const std::string& ways_file,
 
   // Method to get the shape for an edge - since LL is stored as a pair of
   // floats we need to change into PointLL to get length of an edge
-  const auto EdgeShape = [&way_nodes](size_t idx, const size_t count) {
-    std::list<PointLL> shape;
+  auto keep_all_nodes = pt.get<bool>("keep_all_osm_node_ids", false);
+  auto graph_nodes_only = pt.get<bool>("keep_osm_node_ids", false);
+  std::vector<PointLL> shape;
+  std::vector<uint64_t> osm_node_ids;
+  std::string encoded_node_ids(1, static_cast<std::string::value_type>(TaggedValue::kOSMNodeIds));
+  const auto edge_shape = [&way_nodes, &shape, &osm_node_ids, &encoded_node_ids, keep_all_nodes,
+                           graph_nodes_only](size_t idx, const size_t count) {
+    shape.reserve(count);
+    shape.clear();
+    osm_node_ids.reserve(graph_nodes_only ? 2 : count);
+    osm_node_ids.clear();
     for (size_t i = 0; i < count; ++i) {
       auto node = (*way_nodes[idx++]).node;
       shape.emplace_back(node.latlng());
+      if (keep_all_nodes || (graph_nodes_only && (i == 0 || i == count - 1))) {
+        osm_node_ids.push_back(node.osmid_);
+      }
     }
-    return shape;
+    if (!osm_node_ids.empty()) {
+      // chop off the old buffer, encode the new one, then finally insert the encoded length
+      encoded_node_ids.resize(1);
+      encoded_node_ids += encode7int(osm_node_ids);
+      // prepend the length in bytes of the encoded value so we know how much to read later
+      encoded_node_ids.insert(1, encode7int(std::vector{encoded_node_ids.size() - 1}));
+    }
   };
 
   // For each tile in the task
   bool added = false;
-  DataQuality stats;
+  DataQuality stats(pt.get<std::string>("data_quality_dir", ""));
 
   // Lots of times in a given tile we may end up accessing the same
   // shape/attributes twice we avoid doing this by caching it here
@@ -486,7 +557,7 @@ void BuildTileSet(const std::string& ways_file,
 
     try {
       // What actually writes the tile
-      GraphId tile_id = tile.first.Tile_Base();
+      GraphId tile_id = tile.first.tile_base();
       GraphTileBuilder graphtile(tile_dir, tile_id, false);
 
       // Information about tile creation
@@ -528,7 +599,7 @@ void BuildTileSet(const std::string& ways_file,
       //                                      ? nodes.end() - node_itr
       //                                      : std::next(tile_start)->second - tile_start->second));
 
-      while (node_itr != nodes.end() && (*node_itr).graph_id.Tile_Base() == tile_id) {
+      while (node_itr != nodes.end() && (*node_itr).graph_id.tile_base() == tile_id) {
         // amalgamate all the node duplicates into one and the edges that connect to it
         // this moves the iterator for you
         auto bundle = collect_node_edges(node_itr, nodes, edges);
@@ -552,10 +623,6 @@ void BuildTileSet(const std::string& ways_file,
                                                   : GetMultiPolyId(admin_polys, node_ll, graphtile);
           dor = drive_on_right[admin_index];
           default_languages = GetMultiPolyIndexes(language_polys, node_ll);
-
-        } else {
-          admin_index = graphtile.AddAdmin("", "", osmdata.node_names.name(node.country_iso_index()),
-                                           osmdata.node_names.name(node.state_iso_index()));
         }
 
         // Look for potential duplicates
@@ -594,23 +661,14 @@ void BuildTileSet(const std::string& ways_file,
           if (!use_admin_db)
             dor = w.drive_on_right();
 
-          // Validate speed. Set speed limit and truck speed.
+          // Speed values are already clamped to kMaxAssumedSpeed (140) in OSMWay setters.
           uint32_t speed = w.speed();
           if (forward && w.forward_tagged_speed()) {
             speed = w.forward_speed();
           } else if (!forward && w.backward_tagged_speed()) {
             speed = w.backward_speed();
           }
-          if (speed > kMaxAssumedSpeed) {
-            LOG_WARN("Speed = " + std::to_string(speed) + " wayId= " + std::to_string(w.way_id()));
-            speed = kMaxAssumedSpeed;
-          }
           uint32_t speed_limit = w.speed_limit();
-          if (speed_limit > kMaxAssumedSpeed && speed_limit != kUnlimitedSpeedLimit) {
-            LOG_WARN("Speed limit = " + std::to_string(speed_limit) +
-                     " wayId= " + std::to_string(w.way_id()));
-            speed_limit = kMaxAssumedSpeed;
-          }
 
           const uint8_t directed_truck_speed =
               forward ? w.truck_speed_forward() : w.truck_speed_backward();
@@ -620,12 +678,6 @@ void BuildTileSet(const std::string& ways_file,
           uint32_t truck_speed = w.truck_speed() && directed_truck_speed
                                      ? std::min(w.truck_speed(), directed_truck_speed)
                                      : std::max(w.truck_speed(), directed_truck_speed);
-
-          if (truck_speed > kMaxAssumedSpeed) {
-            LOG_WARN("Truck Speed = " + std::to_string(truck_speed) +
-                     " wayId= " + std::to_string(w.way_id()));
-            truck_speed = kMaxAssumedSpeed;
-          }
 
           // Cul du sac
           auto use = w.use();
@@ -639,6 +691,7 @@ void BuildTileSet(const std::string& ways_file,
               CreateSimpleTurnRestriction(w.way_id(), target, nodes, edges, osmdata, ways);
           if (restrictions != 0) {
             stats.simplerestrictions++;
+            build_stats::get().increment(build_stats::kCountSimpleTurnRestrictions);
           }
 
           // traffic signal exists at a non-intersection node
@@ -764,8 +817,8 @@ void BuildTileSet(const std::string& ways_file,
               !graphtile.HasEdgeInfo(edge_pair.second, (*nodes[source]).graph_id,
                                      (*nodes[target]).graph_id, edge_info_offset)) {
 
-            // add the info
-            auto shape = EdgeShape(edge.llindex_, edge.attributes.llcount);
+            // collect the shape (and osm node ids if enabled) from the sequence data
+            edge_shape(edge.llindex_, edge.attributes.llcount);
 
             bool diff_names = false;
             OSMLinguistic::DiffType type = OSMLinguistic::DiffType::kRight;
@@ -869,6 +922,12 @@ void BuildTileSet(const std::string& ways_file,
               tagged_values.push_back(std::move(value));
             }
 
+            // Append osm node ids as tagged values
+            if (!osm_node_ids.empty()) {
+              // not moving here because we want to re-use the string on the next iteration
+              tagged_values.push_back(encoded_node_ids);
+            }
+
             // Update bike_network type
             if (bike_network) {
               bike_network |= w.bike_network();
@@ -907,9 +966,7 @@ void BuildTileSet(const std::string& ways_file,
 
           // ferry speed override.  duration is set on the way
           if (w.ferry() && w.duration()) {
-            // convert to kph
-            uint32_t spd = static_cast<uint32_t>((std::get<0>(found->second) * 3.6) / w.duration());
-            speed = (spd == 0) ? 1 : spd;
+            speed = ferry_speeds.at(w.way_id());
           }
 
           // Add a directed edge and get a reference to it
@@ -943,7 +1000,7 @@ void BuildTileSet(const std::string& ways_file,
             directededge.set_use(Use::kRamp);
           }
 
-          if (!infer_internal_intersections && w.internal()) {
+          if (w.internal()) {
             if (directededge.use() != Use::kRamp && directededge.use() != Use::kTurnChannel)
               directededge.set_internal(true);
           }
@@ -1002,12 +1059,13 @@ void BuildTileSet(const std::string& ways_file,
                 v.emplace_back(idx, lc.from_way_id, osmdata.name_offset_map.name(lc.to_lanes_index),
                                osmdata.name_offset_map.name(lc.from_lanes_index));
               }
-              graphtile.AddLaneConnectivity(v);
+              graphtile.AddLaneConnectivity(std::move(v));
               directededge.set_laneconnectivity(true);
             }
           } catch (std::exception& e) {
-            LOG_WARN("Failed to import lane connectivity for way: " + std::to_string(w.way_id()) +
-                     " : " + e.what());
+            LOG_DEBUG("Failed to import lane connectivity for way: " + std::to_string(w.way_id()) +
+                      " : " + e.what());
+            build_stats::get().increment(build_stats::kFailedLaneConnectivity);
           }
 
           // Set the number of lanes.
@@ -1328,6 +1386,8 @@ void BuildLocalTiles(const unsigned int thread_count,
   uint32_t tile_creation_date =
       DateTime::days_from_pivot_date(DateTime::get_formatted_date(DateTime::iso_date_time(tz)));
 
+  const auto ferry_speeds = ComputeFerrySpeeds(ways_file, way_nodes_file);
+
   LOG_INFO("Building " + std::to_string(tiles.size()) + " tiles with " +
            std::to_string(thread_count) + " threads...");
 
@@ -1354,8 +1414,8 @@ void BuildLocalTiles(const unsigned int thread_count,
                                       std::cref(complex_to_restriction_file),
                                       std::cref(linguistic_node_file), std::cref(tile_dir),
                                       std::cref(osmdata), std::ref(tile_queue), std::ref(tile_lock),
-                                      tile_creation_date, std::cref(pt.get_child("mjolnir")),
-                                      std::ref(results[i]));
+                                      tile_creation_date, std::cref(ferry_speeds),
+                                      std::cref(pt.get_child("mjolnir")), std::ref(results[i]));
   }
 
   // Join all the threads to wait for them to finish up their work
@@ -1372,12 +1432,12 @@ void BuildLocalTiles(const unsigned int thread_count,
       // Add statistics and log issues on this thread
       const auto& stat = result.get_future().get();
       stats.AddStatistics(stat);
-      stat.LogIssues();
     } // If we couldnt write a tile for whatever reason we fail the whole job
     catch (std::exception& e) {
       throw e;
     }
   }
+  stats.LogIssues();
 }
 
 } // namespace
@@ -1475,7 +1535,7 @@ void GraphBuilder::Build(const boost::property_tree::ptree& pt,
   }
 
   // Build tiles at the local level. Form connected graph from nodes and edges.
-  DataQuality stats;
+  DataQuality stats(pt.get<std::string>("mjolnir.data_quality_dir", ""));
   unsigned int threads =
       std::max(static_cast<unsigned int>(1),
                pt.get<unsigned int>("mjolnir.concurrency", std::thread::hardware_concurrency()));
@@ -2116,13 +2176,13 @@ bool GraphBuilder::CreateSignInfoList(
         boost::algorithm::to_lower(tmp);
 
         // remove the "To" For example:  US 11;To I 81;Carlisle;Harrisburg
-        if (boost::starts_with(tmp, "to ")) {
+        if (tmp.starts_with("to ")) {
           exit_list.emplace_back(Sign::Type::kExitToward, false, false, false, 0, 0,
                                  exit_to.substr(3));
           continue;
         }
         // remove the "Toward" For example:  US 11;Toward I 81;Carlisle;Harrisburg
-        if (boost::starts_with(tmp, "toward ")) {
+        if (tmp.starts_with("toward ")) {
           exit_list.emplace_back(Sign::Type::kExitToward, false, false, false, 0, 0,
                                  exit_to.substr(7));
           continue;

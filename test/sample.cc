@@ -5,7 +5,9 @@
 #include "pixels.h"
 
 #include <gtest/gtest.h>
+#ifdef ENABLE_LZ4
 #include <lz4frame.h>
+#endif
 
 #include <cmath>
 #include <filesystem>
@@ -71,6 +73,7 @@ TEST(Sample, create_tile) {
   // gzip it
   EXPECT_TRUE(baldr::deflate(src_func, dst_func)) << "Can't write gzipped elevation tile";
 
+#ifdef ENABLE_LZ4
   // lz4 it
   std::vector<char> lz4_buffer(tile.size() * sizeof(int16_t) * 2, 0);
   size_t out_bytes =
@@ -80,6 +83,7 @@ TEST(Sample, create_tile) {
 
   std::ofstream lzfile("test/data/samplelz4/N40/N40W077.hgt.lz4", std::ios::binary | std::ios::trunc);
   lzfile.write(static_cast<const char*>(static_cast<void*>(lz4_buffer.data())), out_bytes);
+#endif
 }
 
 void _get(const std::string& location) {
@@ -115,9 +119,11 @@ TEST(Sample, getgz) {
   _get("test/data/samplegz");
 };
 
+#ifdef ENABLE_LZ4
 TEST(Sample, getlz4) {
   _get("test/data/samplelz4");
 };
+#endif
 
 struct testable_sample_t : public skadi::sample {
   testable_sample_t(const std::string& dir) : sample(dir) {
@@ -212,27 +218,6 @@ TEST(Sample, store) {
   std::ofstream file("test/data/sample/N00/N00E005.hgt", std::ios::binary | std::ios::trunc);
   file.write(static_cast<const char*>(static_cast<void*>(tile.data())),
              sizeof(int16_t) * tile.size());
-
-  // input for gzip
-  auto src_func = [&tile](z_stream& s) -> int {
-    s.next_in = static_cast<Byte*>(static_cast<void*>(tile.data()));
-    s.avail_in = static_cast<unsigned int>(tile.size() * sizeof(int16_t));
-    return Z_FINISH;
-  };
-
-  // output for gzip
-  std::vector<char> dst_buffer(13000, 0);
-  std::ofstream gzfile("test/data/samplegz/N00/N00E005.hgt.gz", std::ios::binary | std::ios::trunc);
-  auto dst_func = [&dst_buffer, &gzfile](z_stream& s) -> void {
-    // move these bytes to their final resting place
-    auto chunk = s.total_out - gzfile.tellp();
-    gzfile.write(static_cast<const char*>(static_cast<void*>(dst_buffer.data())), chunk);
-    // if more input is coming
-    if (s.avail_in > 0) {
-      s.next_out = static_cast<Byte*>(static_cast<void*>(dst_buffer.data()));
-      s.avail_out = dst_buffer.size();
-    }
-  };
 
   testable_sample_t s("test/data/sample");
 

@@ -14,7 +14,7 @@ Follow these steps to start contributing a translation:
 2. Navigate to https://www.transifex.com/explore/projects/ and search for the `Valhalla Phrases` project.
 3. Submit a request to join the team for the languages you know. You may also request a new language if yours does not appear in the list.
 4. Wait for an email with an invitation to start translating.
-5. From the [dashboard](https://www.transifex.com/valhalla/valhalla-phrases/dashboard/), navigate to the Translate page for your chosen language.
+5. From the [dashboard](https://explore.transifex.com/valhalla/valhalla-phrases/), navigate to the Translate page for your chosen language.
 6. Select the `en-US.json` source file to translate from.
 7. Before you start translating make sure to filter out any phrases with the `notranslate` tag. Apply this filter by selecting Tag > Doesn't contain tag > notranslate.
 8. For more information on how to use Transifex, check out the [getting started guide](https://docs.transifex.com/getting-started-1/translators).
@@ -46,8 +46,7 @@ Czech `aliases` entry example:
 4. Do not translate the JSON keys or phrase tags. An example using the ramp instruction:
 ![Alt text](images/do_not_translate.png)
 
-5. Please translate the JSON values. As needed, reorder the phrase words and tags - the tags must remain in the phrase. An example using the ramp instruction:
-![Alt text](images/translate.png)
+5. Please translate the JSON values. As needed, reorder the phrase words and tags - the tags must remain in the phrase. **Do not update `example_phrases`!** We want it stay English.
 
 6. Run `make check` to verify the tests pass OR move on to step#7 and we can help verify.
 
@@ -138,7 +137,7 @@ Translation files for new languages that are contributed in Transifex are not au
 
 1. Pull the new language:
     ```
-    tx pull --language <lang>
+    tx pull --languages <lang>
     ```
 2. Make sure the new translation filename is following the <lng-REGION.json> convention.
 3. Update `./.tx/config` with the new translation file mapping.

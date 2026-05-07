@@ -19,8 +19,7 @@
     },
     {
       "name": "gdal",
-      "default-features": false,
-      "features": ["recommended-features"]
+      "default-features": false
     },
     "geos",
     {
@@ -29,16 +28,22 @@
       "features": ["rttopo"]
     },
     "pkgconf",
-    "pybind11",
     "rapidjson",
+    "nanobind",
     "spatialite-tools",
     "luajit",
-    "lz4",
     "protobuf",
     "sqlite3",
     "zlib",
     "unordered-dense",
     "libosmium",
     "openssl"
-  ]
+  ],
+  "features": {
+    "elevation-lz4": {
+      "description": "LZ4 decompression support for elevation tiles",
+      "dependencies": ["lz4"]
+    }
+  },
+  "default-features": ["elevation-lz4"]
 }
