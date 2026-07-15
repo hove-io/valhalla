@@ -2,6 +2,7 @@
 * **Removed**
 * **Bug Fix**
 * **Enhancement**
+   * ADDED: Add pedestrian name enricher [#33](https://github.com/hove-io/valhalla/pull/33)
 
 ## Release Date: 2026-04-28 Valhalla 3.7.0
 * **Removed**
