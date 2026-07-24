@@ -7,6 +7,8 @@
 #include <gtest/gtest.h>
 
 #include <fstream>
+#include <list>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -486,6 +488,158 @@ TEST(GraphTileBuilder, TestBinEdges) {
   GraphTileBuilder::tweeners_t tweeners;
   auto bins = GraphTileBuilder::BinEdges(fake, tweeners, false);
   EXPECT_EQ(tweeners.size(), 1) << "This edge leaves a tile for 1 other tile and comes back.";
+}
+
+// Describes one edge to seed into a base tile.
+struct seed_edge {
+  GraphId nodea;
+  GraphId nodeb;
+  uint64_t wayid;
+  std::vector<std::string> names;
+  std::list<PointLL> shape;
+};
+
+// Builds a base tile from the given edges (one EdgeInfo per edge) and stores it to disk.
+void build_base_tile(const std::string& dir,
+                     const GraphId& tile_id,
+                     const std::vector<seed_edge>& edges) {
+  test_graph_tile_builder builder(dir, tile_id, false);
+  for (uint32_t i = 0; i < edges.size(); ++i) {
+    builder.directededges().emplace_back();
+    bool added = false;
+    uint32_t offset = builder.AddEdgeInfo(i, edges[i].nodea, edges[i].nodeb, edges[i].wayid, 0.f, 0,
+                                          0, edges[i].shape, edges[i].names, {}, {}, 0, added);
+    builder.directededges()[i].set_edgeinfo_offset(offset);
+    builder.directededges()[i].set_endnode(edges[i].nodeb);
+  }
+  builder.StoreTileData();
+}
+
+const std::vector<seed_edge>& sample_edges() {
+  static const std::vector<seed_edge> edges = {
+      {GraphId(0, 2, 0), GraphId(0, 2, 1), 100, {"First Street"}, {{0.00f, 0.00f}, {0.01f, 0.01f}}},
+      {GraphId(0, 2, 1), GraphId(0, 2, 2), 200, {}, {{0.01f, 0.01f}, {0.02f, 0.02f}}},
+      {GraphId(0, 2, 2), GraphId(0, 2, 3), 300, {"Third Street"}, {{0.02f, 0.02f}, {0.03f, 0.03f}}},
+  };
+  return edges;
+}
+
+// Reads back the names of every edge of a stored tile.
+std::vector<std::vector<std::string>> read_edge_names(const std::string& dir,
+                                                      const GraphId& tile_id) {
+  auto tile = GraphTile::Create(dir, tile_id);
+  std::vector<std::vector<std::string>> all;
+  for (uint32_t i = 0; i < tile->header()->directededgecount(); ++i) {
+    all.push_back(tile->edgeinfo(tile->directededge(i)).GetNames());
+  }
+  return all;
+}
+
+TEST(GraphTileBuilder, AddNameToEdgeNominal) {
+  const std::string dir = "test/data/builder_name_enrich_nominal";
+  const GraphId tile_id(0, 2, 0);
+  build_base_tile(dir, tile_id, sample_edges());
+
+  // Reopen for editing, name the (unnamed) middle edge, recompute offsets, store.
+  {
+    test_graph_tile_builder edit(dir, tile_id, true);
+    edit.AddNameToEdge(GraphId(0, 2, 1), "Enriched Avenue");
+    edit.RecomputeEdgeInfoOffsets();
+    edit.StoreTileData();
+  }
+
+  auto names = read_edge_names(dir, tile_id);
+  ASSERT_EQ(names.size(), 3);
+  // The enriched edge now carries the road name...
+  ASSERT_EQ(names[1].size(), 1);
+  EXPECT_EQ(names[1][0], "Enriched Avenue");
+  // ...and the surrounding edges are untouched.
+  ASSERT_EQ(names[0].size(), 1);
+  EXPECT_EQ(names[0][0], "First Street");
+  ASSERT_EQ(names[2].size(), 1);
+  EXPECT_EQ(names[2][0], "Third Street");
+
+  // Shapes must survive the EdgeInfo rewrite intact.
+  auto tile = GraphTile::Create(dir, tile_id);
+  EXPECT_EQ(tile->edgeinfo(tile->directededge(0)).shape().size(), 2);
+  EXPECT_EQ(tile->edgeinfo(tile->directededge(1)).shape().size(), 2);
+  EXPECT_EQ(tile->edgeinfo(tile->directededge(2)).shape().size(), 2);
+}
+
+TEST(GraphTileBuilder, AddNameToEdgeNoDuplicate) {
+  const std::string dir = "test/data/builder_name_enrich_dedup";
+  const GraphId tile_id(0, 2, 0);
+  build_base_tile(dir, tile_id, sample_edges());
+
+  {
+    test_graph_tile_builder edit(dir, tile_id, true);
+    // Add the same name twice: the second call must be a no-op (no duplicate NameInfo).
+    edit.AddNameToEdge(GraphId(0, 2, 1), "Repeated Road");
+    edit.AddNameToEdge(GraphId(0, 2, 1), "Repeated Road");
+    // Re-adding an already-present name must also be a no-op.
+    edit.AddNameToEdge(GraphId(0, 2, 0), "First Street");
+    edit.RecomputeEdgeInfoOffsets();
+    edit.StoreTileData();
+  }
+
+  auto names = read_edge_names(dir, tile_id);
+  ASSERT_EQ(names[1].size(), 1);
+  EXPECT_EQ(names[1][0], "Repeated Road");
+  ASSERT_EQ(names[0].size(), 1);
+  EXPECT_EQ(names[0][0], "First Street");
+}
+
+TEST(GraphTileBuilder, AddNameToEdgeThrowsOnWrongTile) {
+  const std::string dir = "test/data/builder_name_enrich_wrongtile";
+  const GraphId tile_id(0, 2, 0);
+  build_base_tile(dir, tile_id, sample_edges());
+
+  test_graph_tile_builder edit(dir, tile_id, true);
+  // A different tile id (same level) must be rejected.
+  EXPECT_THROW(edit.AddNameToEdge(GraphId(7, 2, 0), "Nope"), std::runtime_error);
+}
+
+TEST(GraphTileBuilder, AddNameToEdgeThrowsOnEdgeOutOfRange) {
+  const std::string dir = "test/data/builder_name_enrich_oob";
+  const GraphId tile_id(0, 2, 0);
+  build_base_tile(dir, tile_id, sample_edges());
+
+  test_graph_tile_builder edit(dir, tile_id, true);
+  EXPECT_THROW(edit.AddNameToEdge(GraphId(0, 2, 999), "Nope"), std::runtime_error);
+}
+
+TEST(GraphTileBuilder, RecomputeEdgeInfoOffsetsRoundTrip) {
+  const std::string dir = "test/data/builder_name_enrich_roundtrip";
+  const GraphId tile_id(0, 2, 0);
+  build_base_tile(dir, tile_id, sample_edges());
+
+  // Enrich the FIRST edge so that the offsets of the following edges must shift.
+  {
+    test_graph_tile_builder edit(dir, tile_id, true);
+    edit.AddNameToEdge(GraphId(0, 2, 0), "A Much Longer Street Name To Grow The EdgeInfo");
+    edit.RecomputeEdgeInfoOffsets();
+    edit.StoreTileData();
+  }
+
+  auto tile = GraphTile::Create(dir, tile_id);
+  ASSERT_EQ(tile->header()->directededgecount(), 3);
+
+  // Every directed edge must still resolve to its own coherent EdgeInfo (names + shape),
+  // proving the recomputed offsets and rewritten EdgeInfo list stayed consistent.
+  auto e0 = tile->edgeinfo(tile->directededge(0));
+  ASSERT_EQ(e0.GetNames().size(), 2);
+  EXPECT_EQ(e0.GetNames()[0], "First Street");
+  EXPECT_EQ(e0.GetNames()[1], "A Much Longer Street Name To Grow The EdgeInfo");
+  EXPECT_EQ(e0.shape().size(), 2);
+
+  auto e1 = tile->edgeinfo(tile->directededge(1));
+  EXPECT_TRUE(e1.GetNames().empty());
+  EXPECT_EQ(e1.wayid(), 200);
+
+  auto e2 = tile->edgeinfo(tile->directededge(2));
+  ASSERT_EQ(e2.GetNames().size(), 1);
+  EXPECT_EQ(e2.GetNames()[0], "Third Street");
+  EXPECT_EQ(e2.wayid(), 300);
 }
 
 } // namespace

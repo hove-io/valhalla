@@ -25,6 +25,7 @@
 using namespace valhalla::baldr;
 using namespace valhalla::midgard;
 using namespace valhalla::mjolnir;
+using namespace valhalla::mjolnir::detail;
 
 namespace {
 
@@ -38,9 +39,6 @@ constexpr double kSampleStepMeters = 10.0;
 // and then deduplicate to obtain up to distinct edges.
 constexpr unsigned int kMaxSamplePointsToTest = 100;
 
-// Maximum search distance in meters between a named road and a sidewalk
-constexpr unsigned long kMaxEnrichDistance = 50;
-
 // R-tree types for spatial indexing of named edges
 // We use cartesian coordinates instead geographical because it is clearly faster.
 // To approximate coordinates, we just multiply the longitudes by a tile-constant cos(lat).
@@ -49,52 +47,11 @@ using rtree_point_t = boost::geometry::model::point<float, 2, boost::geometry::c
 using rtree_value_t = std::pair<rtree_point_t, uint32_t>; // point + candidate_idx
 using rtree_t = boost::geometry::index::rtree<rtree_value_t, boost::geometry::index::rstar<16>>;
 
-// Returns true if the edge `use` is a road-specific type
-bool IsRoadUse(Use use) {
-  switch (use) {
-    case Use::kRoad:
-    case Use::kRamp:
-    case Use::kTurnChannel:
-    case Use::kTrack:
-    case Use::kDriveway:
-    case Use::kAlley:
-    case Use::kParkingAisle:
-    case Use::kEmergencyAccess:
-    case Use::kDriveThru:
-    case Use::kCuldesac:
-    case Use::kLivingStreet:
-    case Use::kServiceRoad:
-      return true;
-    default:
-      return false;
-  }
-}
-
-// Stores the name and full geometry needed to score one road candidate.
-struct NamedEdgeCandidate {
-  std::string name;
-  std::vector<PointLL> shape;
-};
-
 // R-tree struct with associated candidates
 struct NamedEdgesTree {
   rtree_t rtree;
   std::vector<NamedEdgeCandidate> candidates;
 };
-
-// Returns the midpoint along the polyline (at 50% of cumulative distance).
-// Falls back to the geometric middle vertex if trim_polyline fails.
-PointLL PolylineMidpoint(const std::vector<PointLL>& shape) {
-  assert(!shape.empty());
-
-  auto midpoints = valhalla::midgard::trim_polyline(shape.begin(), shape.end(), 0.5, 0.5);
-  if (midpoints.empty()) { // should not appear
-    LOG_ERROR("Bug trim_polyline: midpoint of an non-empty edge not found");
-    return PointLL(shape[shape.size() / 2]);
-  }
-
-  return PointLL(midpoints.front());
-}
 
 // Builds an R-tree of named road candidates near the target pedestrian edges.
 // Loads existing tiles intersecting candidate bounding box across all hierarchy levels,
@@ -211,69 +168,6 @@ NamedEdgesTree BuildNamedEdgesTree(GraphReader& reader,
   return tree;
 }
 
-// Computes a length-weighted average distance (in meters) from polyline 'from' to a set
-// of polylines 'tos'. Each vertex of 'from' is projected onto the NEAREST of all 'tos',
-// and every segment contributes the mean of its two endpoint distances, weighted by its
-// share of the total length.
-//
-// Comparing 'from' against several polylines at once matters because Valhalla splits a
-// street into several named road edges sharing one name: grouping them here lets a long
-// pedestrian edge match the whole street instead of being rejected because no single road
-// edge spans its full length.
-//
-// NB: This is a non-symmetrical "distance".
-//
-// Example: pedestrian polyline 'from' = [A, B, C], scored against a single road in 'tos'
-//
-//                            C            A--B is long, B--C is short.
-//                           /|            a, b, c = closest distances from
-//                          / |              each vertex down to the nearest 'to'.
-//   'from' =  A-----------B  |
-//             |           |  |
-//             a           b  c
-//             |           |  |
-//   'to' = ---+-----------+--+---------   (the named road, roughly parallel)
-//
-//   L_ab = length(A,B) = 30 m
-//   L_bc = length(B,C) = 10 m
-//   L = 40 m (total length)
-//   Each segment i contributes the mean of its endpoint distances, weighted by L_i/L:
-//
-//     score = (L_ab/L) * (a + b)/2  +  (L_bc/L) * (b + c)/2
-//           = 0.75   * (a + b)/2  +  0.25   * (b + c)/2
-//
-//   So the long A--B segment dominates the score; a lone far-away vertex on a
-//   tiny segment barely moves it (unlike a Hausdorff / max-based distance).
-float AverageDistanceToPolylines(const std::vector<PointLL>& from,
-                                 const std::vector<const std::vector<PointLL>*>& tos) {
-  if (from.size() < 2 || tos.empty())
-    return std::numeric_limits<float>::max();
-
-  // per vertex of 'from', distance to the nearest of all the street's pieces
-  std::vector<float> vertex_dist(from.size(), std::numeric_limits<float>::max());
-  for (size_t i = 0; i < from.size(); ++i) {
-    for (const auto* to : tos) {
-      if (to->empty())
-        continue;
-      vertex_dist[i] =
-          std::min(vertex_dist[i], static_cast<float>(std::get<1>(from[i].ClosestPoint(*to))));
-    }
-  }
-
-  float weighted_sum = 0.f;
-  float total_len = 0.f;
-  for (size_t i = 0; i + 1 < from.size(); ++i) {
-    float seg_len = from[i].Distance(from[i + 1]);
-    weighted_sum += seg_len * 0.5f * (vertex_dist[i] + vertex_dist[i + 1]);
-    total_len += seg_len;
-  }
-
-  if (total_len <= 0.f)
-    return std::numeric_limits<float>::max();
-
-  return weighted_sum / total_len;
-}
-
 /// Finds the best matching street name for a pedestrian edge by querying the nearest
 // sampled points in the R-tree. Candidate road edges are deduplicated and grouped by
 // name (a street is often split into several edges), then each street is scored against
@@ -324,22 +218,37 @@ std::string FindNearestName(const NamedEdgesTree& tree,
   return best_name; // can be empty if all tested streets are > kMaxEnrichDistance
 }
 
+// Builds an R-tree over in-memory road candidates, resampling each candidate shape into
+// points spaced at most kSampleStepMeters apart (all points retained, no bounding-box
+// filtering). Used by detail::FindNearestRoadName so the scoring can be tested without tiles.
+NamedEdgesTree BuildTreeFromCandidates(const std::vector<NamedEdgeCandidate>& candidates,
+                                       const float cos_lat) {
+  NamedEdgesTree tree;
+  tree.candidates = candidates;
+
+  std::vector<rtree_value_t> named_edge_values;
+  for (uint32_t candidate_idx = 0; candidate_idx < candidates.size(); ++candidate_idx) {
+    const auto& shape = candidates[candidate_idx].shape;
+    if (shape.empty())
+      continue;
+
+    const auto sampled_points = resample_spherical_polyline(shape, kSampleStepMeters, true);
+    for (const auto& sample : sampled_points) {
+      named_edge_values.emplace_back(rtree_point_t(sample.lng() * cos_lat, sample.lat()),
+                                     candidate_idx);
+    }
+  }
+
+  tree.rtree = rtree_t(named_edge_values.begin(), named_edge_values.end());
+  return tree;
+}
+
 // Unit pedestrian enrichment of an edge
 // All enrichments are bulk-loaded in one pass at the end
 struct Enrichment {
   uint32_t edge_num;
   std::string name;
 };
-
-// Returns true if the edge `use` is a pedestrian-specific type that should be enriched
-bool IsPedestrianUseToEnrich(Use use) {
-  switch (use) {
-    case Use::kSidewalk:
-      return true;
-    default:
-      return false;
-  }
-}
 
 // Stores target pedestrian edges indices and their aggregate geographic bounding box.
 struct PedestrianTargets {
@@ -526,6 +435,116 @@ void EnrichWorker(const boost::property_tree::ptree& pt,
 
 namespace valhalla {
 namespace mjolnir {
+namespace detail {
+
+bool IsRoadUse(Use use) {
+  switch (use) {
+    case Use::kRoad:
+    case Use::kRamp:
+    case Use::kTurnChannel:
+    case Use::kTrack:
+    case Use::kDriveway:
+    case Use::kAlley:
+    case Use::kParkingAisle:
+    case Use::kEmergencyAccess:
+    case Use::kDriveThru:
+    case Use::kCuldesac:
+    case Use::kLivingStreet:
+    case Use::kServiceRoad:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsPedestrianUseToEnrich(Use use) {
+  switch (use) {
+    case Use::kSidewalk:
+      return true;
+    default:
+      return false;
+  }
+}
+
+PointLL PolylineMidpoint(const std::vector<PointLL>& shape) {
+  assert(!shape.empty());
+
+  auto midpoints = valhalla::midgard::trim_polyline(shape.begin(), shape.end(), 0.5, 0.5);
+  if (midpoints.empty()) { // should not appear
+    LOG_ERROR("Bug trim_polyline: midpoint of an non-empty edge not found");
+    return PointLL(shape[shape.size() / 2]);
+  }
+
+  return PointLL(midpoints.front());
+}
+
+// Comparing 'from' against several polylines at once matters because Valhalla splits a
+// street into several named road edges sharing one name: grouping them here lets a long
+// pedestrian edge match the whole street instead of being rejected because no single road
+// edge spans its full length.
+//
+// NB: This is a non-symmetrical "distance".
+//
+// Example: pedestrian polyline 'from' = [A, B, C], scored against a single road in 'tos'
+//
+//                            C            A--B is long, B--C is short.
+//                           /|            a, b, c = closest distances from
+//                          / |              each vertex down to the nearest 'to'.
+//   'from' =  A-----------B  |
+//             |           |  |
+//             a           b  c
+//             |           |  |
+//   'to' = ---+-----------+--+---------   (the named road, roughly parallel)
+//
+//   L_ab = length(A,B) = 30 m
+//   L_bc = length(B,C) = 10 m
+//   L = 40 m (total length)
+//   Each segment i contributes the mean of its endpoint distances, weighted by L_i/L:
+//
+//     score = (L_ab/L) * (a + b)/2  +  (L_bc/L) * (b + c)/2
+//           = 0.75   * (a + b)/2  +  0.25   * (b + c)/2
+//
+//   So the long A--B segment dominates the score; a lone far-away vertex on a
+//   tiny segment barely moves it (unlike a Hausdorff / max-based distance).
+float AverageDistanceToPolylines(const std::vector<PointLL>& from,
+                                 const std::vector<const std::vector<PointLL>*>& tos) {
+  if (from.size() < 2 || tos.empty())
+    return std::numeric_limits<float>::max();
+
+  // per vertex of 'from', distance to the nearest of all the street's pieces
+  std::vector<float> vertex_dist(from.size(), std::numeric_limits<float>::max());
+  for (size_t i = 0; i < from.size(); ++i) {
+    for (const auto* to : tos) {
+      if (to->empty())
+        continue;
+      vertex_dist[i] =
+          std::min(vertex_dist[i], static_cast<float>(std::get<1>(from[i].ClosestPoint(*to))));
+    }
+  }
+
+  float weighted_sum = 0.f;
+  float total_len = 0.f;
+  for (size_t i = 0; i + 1 < from.size(); ++i) {
+    float seg_len = from[i].Distance(from[i + 1]);
+    weighted_sum += seg_len * 0.5f * (vertex_dist[i] + vertex_dist[i + 1]);
+    total_len += seg_len;
+  }
+
+  if (total_len <= 0.f)
+    return std::numeric_limits<float>::max();
+
+  return weighted_sum / total_len;
+}
+
+std::string FindNearestRoadName(const std::vector<NamedEdgeCandidate>& candidates,
+                                const std::vector<PointLL>& pedestrian_shape,
+                                const float cos_lat) {
+  const NamedEdgesTree tree = BuildTreeFromCandidates(candidates, cos_lat);
+  std::vector<rtree_value_t> results;
+  return FindNearestName(tree, pedestrian_shape, results, cos_lat);
+}
+
+} // namespace detail
 
 void EnrichPedestrianEdgeNames(const boost::property_tree::ptree& pt) {
   LOG_INFO("Starting pedestrian edge name enrichment...");
