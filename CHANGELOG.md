@@ -25,6 +25,7 @@
    * FIXED: a zero `linear_cost_factors` factor no longer discards the factors of every feature behind it [#6329](https://github.com/valhalla/valhalla/pull/6329)
    * FIXED: trivial CostMatrix path where either source/target is node snapped [#6334](https://github.com/valhalla/valhalla/pull/6334)
 * **Enhancement**
+   * UPDATED: timezone database to 2026d [#36](https://github.com/hove-io/valhalla/pull/36)
    * CHANGED: move `GraphTile::GetTileId` to `GraphId::FromTilePath` as a static factory ctor [#6237](https://github.com/valhalla/valhalla/pull/6237)
    * CHANGED: use `filtered_edges` in CostMatrix's second pass [#6236](https://github.com/valhalla/valhalla/pull/6236)
    * ADDED: `cost` in verbose matrix output [#6249](https://github.com/valhalla/valhalla/pull/6249)
