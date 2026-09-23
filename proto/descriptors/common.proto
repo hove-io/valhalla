@@ -196,6 +196,7 @@ message BikeShareStationInfo {
   float rent_cost = 6;
   float return_cost = 7;
   uint64 osm_node_id= 8;
+  string bss_uri = 9;
 }
 
 message TransitPlatformInfo {
