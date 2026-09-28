@@ -515,17 +515,17 @@ public:
   void AddLandmark(const baldr::GraphId& edge_id, const baldr::Landmark& landmark);
 
   /**
-   * Adds a name to the given edge's EdgeInfo. Does not update offsets:
+   * Adds names to the given edge's EdgeInfo. Does not update offsets:
    * RecomputeEdgeInfoOffsets() must be called after all modifications.
    *
    * @param edge_id  the edge id to modify (must belong to this tile)
-   * @param name     the street name to associate to the edge
+   * @param names    the street names to associate to the edge
    */
-  void AddNameToEdge(const baldr::GraphId& edge_id, const std::string& name);
+  void AddNamesToEdge(const baldr::GraphId& edge_id, const std::vector<std::string>& name);
 
   /**
    * Recomputes all edgeinfo offsets by walking edgeinfo_list_ in order.
-   * Call after batch modifications via AddNameToEdge().
+   * Call after batch modifications via AddNamesToEdge().
    */
   void RecomputeEdgeInfoOffsets();
 

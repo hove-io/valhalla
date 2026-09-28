@@ -1409,7 +1409,7 @@ void GraphTileBuilder::AddLandmark(const GraphId& edge_id, const Landmark& landm
   edgeinfo_offset_map_ = std::move(new_edgeinfo_offset_map_);
 }
 
-void GraphTileBuilder::AddNameToEdge(const GraphId& edge_id, const std::string& name) {
+void GraphTileBuilder::AddNamesToEdge(const GraphId& edge_id, const std::vector<std::string>& names) {
   // check the edge id makes sense
   if (header_builder_.graphid().tile_base() != edge_id.tile_base()) {
     throw std::runtime_error("Tile id doesn't match with the current builder");
@@ -1427,16 +1427,19 @@ void GraphTileBuilder::AddNameToEdge(const GraphId& edge_id, const std::string& 
     throw std::runtime_error("Couldn't find edge info for edge: " + std::to_string(edge_id));
   }
 
-  uint32_t name_offset = AddName(name);
+  // add each name, preserving order and skipping duplicates already on the edge
+  for (const auto& name : names) {
+    uint32_t name_offset = AddName(name);
 
-  // avoid adding duplicate name to edges
-  if (edge_info_it->second->has_name_info(name_offset)) {
-    return;
+    // avoid adding duplicate name to edges
+    if (edge_info_it->second->has_name_info(name_offset)) {
+      continue;
+    }
+
+    // TODO: complete name_info with additional_fields_, is_route_num_, tagged_
+    NameInfo name_info{name_offset, 0, 0, 0};
+    edge_info_it->second->AddNameInfo(name_info);
   }
-
-  // TODO: complete name_info with additional_fields_, is_route_num_, tagged_
-  NameInfo name_info{name_offset, 0, 0, 0};
-  edge_info_it->second->AddNameInfo(name_info);
 }
 
 void GraphTileBuilder::RecomputeEdgeInfoOffsets() {

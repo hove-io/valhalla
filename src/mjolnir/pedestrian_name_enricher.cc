@@ -41,15 +41,12 @@ constexpr unsigned int kMaxSamplePointsToTest = 100;
 // Maximum search distance in meters between a named road and a sidewalk
 constexpr unsigned long kMaxEnrichDistance = 50;
 
-// Minimum pedestrian edge length (in meters) to enrich. Very short fragments (e.g. the
-// 1-3 m connectors flanking a pedestrian crossing) sit right next to the perpendicular
-// street they meet, so a single static name is ambiguous and misleading. Leaving them
-// unnamed lets Odin adopt the continuing street's name when it builds the maneuver.
-constexpr uint32_t kMinEnrichLengthMeters = 5;
-
-// Maximum ratio by which the best street must beat the runner-up for the
-// match to be considered unambiguous. If two different streets score almost the same,
-// picking one is a coin-flip and misleading, so we leave the edge unnamed.
+// Score tolerance for keeping a street name relative to the best (lowest) score.
+// Since a good score is small, a name is kept only if its score is within
+// best_score / kMaxScoreRatio (i.e. best_score > kMaxScoreRatio * score).
+// With kMaxScoreRatio < 1 this lets slightly-worse-scoring streets share the
+// name (multi-naming for short connectors), while streets that score much worse
+// than the best are dropped. The best street itself always passes.
 constexpr float kMaxScoreRatio = 0.5f;
 
 // R-tree types for spatial indexing of named edges
@@ -285,14 +282,14 @@ float AverageDistanceToPolylines(const std::vector<PointLL>& from,
   return weighted_sum / total_len;
 }
 
-/// Finds the best matching street name for a pedestrian edge by querying the nearest
+/// Finds the best matching street names for a pedestrian edge by querying the nearest
 // sampled points in the R-tree. Candidate road edges are deduplicated and grouped by
 // name (a street is often split into several edges), then each street is scored against
-// the pedestrian edge with the length-weighted polyline distance; the closest one wins.
-std::string FindNearestName(const NamedEdgesTree& tree,
-                            const std::vector<PointLL>& pedestrian_shape,
-                            std::vector<rtree_value_t>& results,
-                            const float cos_lat) {
+// the pedestrian edge with the length-weighted polyline distance; the closest one win.
+std::vector<std::string> FindNearestNames(const NamedEdgesTree& tree,
+                                          const std::vector<PointLL>& pedestrian_shape,
+                                          std::vector<rtree_value_t>& results,
+                                          const float cos_lat) {
   PointLL center = PolylineMidpoint(pedestrian_shape);
   results.clear(); // clear content but memory is kept
 
@@ -321,38 +318,45 @@ std::string FindNearestName(const NamedEdgesTree& tree,
     shapes_by_name[candidate.name].push_back(&candidate.shape);
   }
 
-  // the street name with the best aggregated score wins; we also track the runner-up
-  // to reject ambiguous matches
-  float best_score = std::numeric_limits<float>::max();
-  float second_score = std::numeric_limits<float>::max();
-  std::string best_name;
+  // collect scored names
+  std::vector<std::pair<float, std::string>> scored_names;
+  scored_names.reserve(shapes_by_name.size());
+  float best_score = kMaxEnrichDistance;
   for (const auto& [name, shapes] : shapes_by_name) {
     float score = AverageDistanceToPolylines(sampled_pedestrian, shapes);
-    if (score < best_score) {
-      second_score = best_score;
-      best_score = score;
-      best_name = name;
-    } else if (score < second_score) {
-      second_score = score;
+    // too far
+    if (score > kMaxEnrichDistance)
+      continue;
+    scored_names.emplace_back(score, name);
+    best_score = std::min(best_score, score);
+  }
+
+  // no usable name
+  if (scored_names.empty())
+    return {};
+
+  // sort by ascending order: more relevant name first
+  std::sort(scored_names.begin(), scored_names.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+
+  // we keep only names with good score compared to the best one
+  std::vector<std::string> names;
+  for (const auto& [score, name] : scored_names) {
+    if (best_score > kMaxScoreRatio * score) {
+      names.push_back(name);
+    } else {
+      break;
     }
   }
 
-  // too far: no usable name
-  if (best_score > kMaxEnrichDistance)
-    return {};
-
-  // ambiguous: the runner-up street is almost as close, so naming is misleading
-  if (best_score > kMaxScoreRatio * second_score)
-    return {};
-
-  return best_name; // can be empty if all tested streets are > kMaxEnrichDistance or ambiguous
+  return names;
 }
 
 // Unit pedestrian enrichment of an edge
 // All enrichments are bulk-loaded in one pass at the end
 struct Enrichment {
   uint32_t edge_num;
-  std::string name;
+  std::vector<std::string> names;
 };
 
 // Returns true if the edge `use` is a pedestrian-specific type that should be enriched
@@ -380,11 +384,6 @@ PedestrianTargets CollectPedestrianTargets(const graph_tile_ptr& tile) {
 
     // skip shortcuts and edge uses that are not eligible for enrichment
     if (edge->is_shortcut() || !IsPedestrianUseToEnrich(edge->use()))
-      continue;
-
-    // skip very short fragments: their nearest named road is ambiguous, so we leave them unnamed and
-    // let Odin infer the correct name from the continuing edge
-    if (edge->length() < kMinEnrichLengthMeters)
       continue;
 
     auto edge_info = tile->edgeinfo(edge);
@@ -492,16 +491,16 @@ void EnrichWorker(const boost::property_tree::ptree& pt,
           continue;
         }
 
-        auto name = FindNearestName(tree, shape, results, cos_lat);
+        auto names = FindNearestNames(tree, shape, results, cos_lat);
 
         if (!results.empty())
           ++queries_with_results;
 
-        if (name.empty()) {
+        if (names.empty()) {
           ++queries_without_name;
           continue;
         } else {
-          enrichments.push_back({edge_num, name});
+          enrichments.push_back({edge_num, names});
         }
       }
 
@@ -517,7 +516,7 @@ void EnrichWorker(const boost::property_tree::ptree& pt,
       if (!enrichments.empty()) {
         for (const auto& e : enrichments) {
           GraphId current_edge_id(tile_id.tileid(), tile_id.level(), e.edge_num);
-          tilebuilder.AddNameToEdge(current_edge_id, e.name);
+          tilebuilder.AddNamesToEdge(current_edge_id, e.names);
           enriched_edges_in_tile++;
         }
 
