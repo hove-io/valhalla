@@ -12,6 +12,7 @@
 #include "odin/sign.h"
 #include "odin/signs.h"
 #include "odin/util.h"
+#include "proto/common.pb.h"
 #include "proto/directions.pb.h"
 #include "proto/options.pb.h"
 
@@ -46,6 +47,11 @@ constexpr float kShortTurnChannelThreshold = 0.036f; // Kilometers
 
 constexpr float kShortForkThreshold = 0.05f; // Kilometers
 
+// Kilometers - maximum length under which a pedestrian segment is considered a
+// mere connector/sidewalk/crosswalk that can be folded into a neighboring
+// maneuver instead of producing its own micro-instruction.
+constexpr float kMaxPedestrianConnectorLength = 0.008f; // 8 meters
+
 // Kilometers - picked since the next rounded maneuver announcement will happen
 // in a quarter mile or 400 meters
 constexpr float kShortContinueThreshold = 0.6f;
@@ -79,6 +85,53 @@ bool is_pair(const std::vector<std::string>& tokens) {
 bool has_level_changes(
     const ::google::protobuf::RepeatedPtrField<valhalla::TripLeg_Edge_Level>& levels) {
   return levels.size() == 1 ? levels[0].start() != levels[0].end() : levels.size() != 0;
+}
+
+// Returns true if the maneuver is a short pedestrian segment that is safe to
+// absorb into an adjacent maneuver (short connector, sidewalk link, or
+// crosswalk). Such segments only clutter the narrative ("Turn ... onto A/B/C.
+// Continue 4 m", "Continue on the walkway. Continue 8 m") and carry no useful
+// routing decision of their own.
+//
+// A segment is absorbable only when ALL of the following hold:
+//   - it is walked (pedestrian travel mode),
+//   - it is very short (below kMaxPedestrianConnectorLength),
+//   - it is a walkway or a pedestrian crossing (footway/crosswalk),
+//   - it is NOT a vertical/complex element that must stay a distinct
+//     instruction (steps, elevator, escalator, ferry, roundabout, ramp), and
+//   - it is neither the start nor the destination maneuver, and not transit.
+bool IsAbsorbableShortPedestrianSegment(const Maneuver& man) {
+  // Must be walked
+  if (man.travel_mode() != valhalla::TravelMode::kPedestrian) {
+    return false;
+  }
+
+  // Must be very short
+  if (man.length(valhalla::Options::kilometers) > kMaxPedestrianConnectorLength) {
+    return false;
+  }
+
+  // Must be a walkway/footway or a pedestrian crossing. This covers both the
+  // enriched named connectors (kNamedWalkway) and the unnamed crosswalks
+  // (kUnnamedWalkway with pedestrian_crossing()).
+  const bool is_walkway_like = man.is_walkway() || man.pedestrian_crossing();
+  if (!is_walkway_like) {
+    return false;
+  }
+
+  // Never absorb structural / vertical elements: they must stay their own
+  // instruction for guidance to make sense.
+  if (man.is_steps() || man.indoor_steps() || man.elevator() || man.escalator() || man.ferry() ||
+      man.rail_ferry() || man.roundabout() || man.ramp()) {
+    return false;
+  }
+
+  // Never absorb start, destination or transit maneuvers.
+  if (man.IsStartType() || man.IsDestinationType() || man.IsTransit()) {
+    return false;
+  }
+
+  return true;
 }
 
 } // namespace
@@ -558,6 +611,58 @@ void ManeuversBuilder::Combine(std::list<Maneuver>& maneuvers) {
         prev_man = curr_man;
         curr_man = next_man;
         ++next_man;
+      }
+      // Combine a short pedestrian connector / sidewalk link / crosswalk with an
+      // adjacent pedestrian maneuver so it does not produce its own micro-instruction
+      // ("Continue on the walkway. Continue for 4 m."). Runs before the trail_type
+      // guard below so a short unnamed crosswalk or a short enriched connector can be
+      // folded into its (named) neighbor.
+      else if (curr_man->travel_mode() == TravelMode::kPedestrian &&
+               next_man->travel_mode() == TravelMode::kPedestrian && (curr_man != next_man) &&
+               !curr_man->IsStartType() && !next_man->IsDestinationType() &&
+               // Never fold specialized segments
+               !curr_man->is_steps() && !next_man->is_steps() && !curr_man->elevator() &&
+               !next_man->elevator() && !curr_man->escalator() && !next_man->escalator() &&
+               !curr_man->ferry() && !next_man->ferry() && !curr_man->rail_ferry() &&
+               !next_man->rail_ferry() && !curr_man->roundabout() && !next_man->roundabout() &&
+               !curr_man->ramp() && !next_man->ramp() &&
+               // At least one of the two is a short absorbable connector
+               (IsAbsorbableShortPedestrianSegment(*curr_man) ||
+                IsAbsorbableShortPedestrianSegment(*next_man))) {
+
+        LOG_TRACE("+++ Combine: short pedestrian connector +++");
+
+        const bool curr_is_connector = IsAbsorbableShortPedestrianSegment(*curr_man);
+        const bool next_is_connector = IsAbsorbableShortPedestrianSegment(*next_man);
+
+        // Decide which maneuver carries the "real" street identity:
+        // - if only one is a connector, keep the other one's identity;
+        // - if both are connectors, keep the longer one's.
+        const bool keep_next_identity =
+            (curr_is_connector && !next_is_connector) ||
+            (curr_is_connector && next_is_connector && (next_man->length() > curr_man->length()));
+
+        // CombineManeuvers keeps curr_man's fields (type, direction, names) and only
+        // accumulates length/time from next_man. So when the surviving identity is
+        // next_man's, copy it into curr_man before merging.
+        if (keep_next_identity) {
+          curr_man->set_type(next_man->type());
+          curr_man->set_turn_degree(next_man->turn_degree());
+          curr_man->set_begin_relative_direction(next_man->begin_relative_direction());
+          curr_man->set_trail_type(next_man->trail_type());
+          curr_man->set_pedestrian_crossing(next_man->pedestrian_crossing());
+          if (next_man->HasStreetNames()) {
+            curr_man->set_street_names(next_man->street_names().clone());
+          } else {
+            curr_man->ClearStreetNames();
+          }
+        }
+
+        // A connector must never surface its enriched names as begin street names.
+        curr_man->ClearBeginStreetNames();
+
+        next_man = CombineManeuvers(maneuvers, curr_man, next_man);
+        maneuvers_have_been_combined = true;
       }
       // Do not combine
       // if trail type is different (unnamed/named pedestrian/bike/mtb)
