@@ -45,7 +45,7 @@ constexpr unsigned long kMaxEnrichDistance = 50;
 // 1-6 m connectors flanking a pedestrian crossing) sit right next to the perpendicular
 // street they meet, so a single static name is ambiguous and misleading. Leaving them
 // unnamed lets Odin adopt the continuing street's name when it builds the maneuver.
-constexpr uint32_t kMinEnrichLengthMeters = 7;
+constexpr uint32_t kMinEnrichLengthMeters = 6;
 
 // Maximum ratio by which the best street must beat the runner-up for the
 // match to be considered unambiguous. If two different streets score almost the same,
@@ -401,7 +401,7 @@ PedestrianTargets CollectPedestrianTargets(const graph_tile_ptr& tile) {
 
     // skip very short fragments: their nearest named road is ambiguous, so we leave them unnamed and
     // let Odin infer the correct name from the continuing edge
-    if (edge->length() < kMinEnrichLengthMeters)
+    if (edge->length() <= kMinEnrichLengthMeters)
       continue;
 
     auto edge_info = tile->edgeinfo(edge);

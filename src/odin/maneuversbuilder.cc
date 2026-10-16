@@ -102,7 +102,7 @@ bool is_mergeable_unnamed_walkway(const Maneuver& man, const EnhancedTripLeg* tr
          !man.HasStreetNames();
 }
 
-bool is_named_walkway(const Maneuver& man, EnhancedTripLeg* trip_path) {
+bool is_named_walkway(const Maneuver& man, const EnhancedTripLeg* trip_path) {
   return is_walkway_large_use(man, trip_path) && man.HasStreetNames();
 }
 
@@ -551,7 +551,7 @@ void ManeuversBuilder::Combine(std::list<Maneuver>& maneuvers) {
           }
           maneuvers_have_been_combined = true;
         } else if (common_name || !next_next_man->HasStreetNames()) {
-          // No real global turn (artificial chicane), next_next is unnamed:
+          // No real global turn (artificial chicane), same name or next_next is unnamed:
           // merge all 3
           LOG_TRACE("+++ Combine: artificial chicane connector, merge all +++");
           next_man = CombineManeuvers(maneuvers, curr_man, next_man); // connector into curr
@@ -564,6 +564,7 @@ void ManeuversBuilder::Combine(std::list<Maneuver>& maneuvers) {
           LOG_TRACE(
               "+++ Combine: artificial chicane connector into previous (unnamed before, named after) +++");
           next_man = CombineManeuvers(maneuvers, curr_man, next_man);
+          maneuvers_have_been_combined = true;
         } else {
           // No real global turn (artificial chicane), but both sides named differently:
           // always merge connector into next_next
@@ -588,6 +589,7 @@ void ManeuversBuilder::Combine(std::list<Maneuver>& maneuvers) {
       else if (is_mergeable_unnamed_walkway(*next_man, trip_path_)) {
         const bool short_enough = next_man->length(Options::kilometers) <= kShortUnnamedWalkwayLength;
         if ((short_enough || !has_significant_direction_change(*next_man))) {
+          LOG_TRACE("+++ Combine: unnamed walkway into previous +++");
           next_man = CombineManeuvers(maneuvers, curr_man, next_man);
           maneuvers_have_been_combined = true;
         } else {
@@ -597,8 +599,7 @@ void ManeuversBuilder::Combine(std::list<Maneuver>& maneuvers) {
           ++next_man;
         }
       }
-      // Combine an unnamed walkway into next if next is named and without significant direction
-      // change
+      // Combine an unnamed walkway into next if next is named and continue / keep straight
       else if (is_mergeable_unnamed_walkway(*curr_man, trip_path_) &&
                is_named_walkway(*next_man, trip_path_) &&
                (next_man->begin_relative_direction() == Maneuver::RelativeDirection::kKeepStraight ||
@@ -616,6 +617,7 @@ void ManeuversBuilder::Combine(std::list<Maneuver>& maneuvers) {
                !curr_man->street_names().FindCommonBaseNames(next_man->street_names())->empty()) {
         LOG_TRACE("+++ Combine: walkways with same name without significant direction change+++");
         next_man = CombineManeuvers(maneuvers, curr_man, next_man);
+        maneuvers_have_been_combined = true;
       }
       // Do not combine
       // if travel mode is different
