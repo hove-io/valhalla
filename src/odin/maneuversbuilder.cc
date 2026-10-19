@@ -1,4 +1,3 @@
-#include "odin/maneuversbuilder.h"
 #include "baldr/graphconstants.h"
 #include "baldr/streetname.h"
 #include "baldr/streetnames.h"
@@ -9,6 +8,8 @@
 #include "exceptions.h"
 #include "midgard/logging.h"
 #include "midgard/util.h"
+#include "odin/enhancedtrippath.h"
+#include "odin/maneuversbuilder.h"
 #include "odin/sign.h"
 #include "odin/signs.h"
 #include "odin/util.h"
@@ -62,6 +63,8 @@ constexpr float kSmallEndRampForkThreshold = 0.125f;
 constexpr uint32_t kMaxWordCount = 5;
 constexpr uint32_t kMaxStreetNameLength = 25;
 
+constexpr float kShortUnnamedWalkwayLength = 0.006f;
+
 std::vector<std::string> split(const std::string& source, char delimiter) {
   std::vector<std::string> tokens;
   std::string token;
@@ -79,6 +82,55 @@ bool is_pair(const std::vector<std::string>& tokens) {
 bool has_level_changes(
     const ::google::protobuf::RepeatedPtrField<valhalla::TripLeg_Edge_Level>& levels) {
   return levels.size() == 1 ? levels[0].start() != levels[0].end() : levels.size() != 0;
+}
+
+// Returns true for all walkway use.
+//
+// Maneuver::is_walkway() returns true only for Use::kFootway,
+// and it does not include sidewalks, pedestrian crossings etc.
+bool is_walkway_large_use(const Maneuver& man, const EnhancedTripLeg* trip_path) {
+  if (!trip_path)
+    return false;
+  auto edge = trip_path->GetCurrEdge(man.begin_node_index());
+  return edge &&
+         (edge->IsBridlewayUse() || edge->IsFootwayUse() || edge->IsPathUse() ||
+          edge->IsPedestrianUse() || edge->IsPedestrianCrossingUse() || edge->IsSidewalkUse());
+}
+
+bool is_mergeable_unnamed_walkway(const Maneuver& man, const EnhancedTripLeg* trip_path) {
+  return !man.IsStartType() && !man.IsDestinationType() && is_walkway_large_use(man, trip_path) &&
+         !man.HasStreetNames();
+}
+
+bool is_named_walkway(const Maneuver& man, const EnhancedTripLeg* trip_path) {
+  return is_walkway_large_use(man, trip_path) && man.HasStreetNames();
+}
+
+// True for maneuvers that do not signal a significant direction change:
+// "Continue" / "Keep left/right" are slight bends, not turns.
+bool has_significant_direction_change(const Maneuver& man) {
+  switch (man.type()) {
+    case valhalla::DirectionsLeg_Maneuver_Type_kContinue:
+    case valhalla::DirectionsLeg_Maneuver_Type_kSlightRight:
+    case valhalla::DirectionsLeg_Maneuver_Type_kSlightLeft:
+    case valhalla::DirectionsLeg_Maneuver_Type_kStayStraight:
+    case valhalla::DirectionsLeg_Maneuver_Type_kStayRight:
+    case valhalla::DirectionsLeg_Maneuver_Type_kStayLeft:
+      return false;
+    default:
+      return true;
+  }
+}
+
+bool is_short_mergeable_pedestrian_connector(const Maneuver& man, EnhancedTripLeg* trip_path) {
+  return is_mergeable_unnamed_walkway(man, trip_path) &&
+         man.length(valhalla::Options::kilometers) <= kShortUnnamedWalkwayLength;
+}
+
+// Returns a value in [-180 ; 179]
+// A negative value is a left turn, a positive value is a right turn.
+int normalize_degree(int d) {
+  return ((d + 540) % 360) - 180;
 }
 
 } // namespace
@@ -451,6 +503,121 @@ void ManeuversBuilder::Combine(std::list<Maneuver>& maneuvers) {
         prev_man = curr_man;
         curr_man = next_man;
         ++next_man;
+      }
+      // Combine a short mergeable pedestrian connector:
+      // look at the maneuver next_next (after next) and decide to merge:
+      // - connector in curr_man, or
+      // - next_next in connector, or
+      // - combine all
+      else if (next_man != maneuvers.end() &&
+               is_short_mergeable_pedestrian_connector(*next_man, trip_path_) &&
+               std::next(next_man) != maneuvers.end()) {
+
+        auto next_next_man = std::next(next_man);
+
+        // Compute net global turn across the triplet
+        const int net_turn_degree =
+            normalize_degree(next_man->turn_degree() + next_next_man->turn_degree());
+        const bool real_turn = std::abs(net_turn_degree) >= 45;
+
+        const bool common_name =
+            !curr_man->street_names().FindCommonBaseNames(next_next_man->street_names())->empty();
+
+        if (real_turn) {
+          // Real direction change: merge the connector into whichever side
+          // carries the "smaller" turn (the connector belongs to the maneuver
+          // where the bend is weakest)
+          const int turn_into_connector =
+              normalize_degree(GetTurnDegree(curr_man->end_heading(), next_man->begin_heading()));
+          const int turn_into_next_next = normalize_degree(
+              GetTurnDegree(next_man->end_heading(), next_next_man->begin_heading()));
+
+          if (std::abs(turn_into_connector) <= std::abs(turn_into_next_next)) {
+            // connector merges into curr (previous)
+            LOG_TRACE("+++ Combine: connector into previous +++");
+            next_man = CombineManeuvers(maneuvers, curr_man, next_man);
+          } else {
+            // connector merges into next_next: adopt next_next's names/type
+            LOG_TRACE("+++ Combine: connector into next +++");
+            if (next_next_man->HasStreetNames()) {
+              next_man->set_street_names(next_next_man->street_names().clone());
+              next_man->set_trail_type(next_next_man->trail_type());
+            }
+            auto merged_next = CombineManeuvers(maneuvers, next_man, next_next_man);
+            // advance explicitly: the merged maneuver is the old next_man
+            prev_man = curr_man;
+            curr_man = next_man;
+            next_man = merged_next;
+          }
+          maneuvers_have_been_combined = true;
+        } else if (common_name || !next_next_man->HasStreetNames()) {
+          // No real global turn (artificial chicane), same name or next_next is unnamed:
+          // merge all 3
+          LOG_TRACE("+++ Combine: artificial chicane connector, merge all +++");
+          next_man = CombineManeuvers(maneuvers, curr_man, next_man); // connector into curr
+          // now, next_man is on next_next
+          next_man = CombineManeuvers(maneuvers, curr_man, next_man); // next_next into curr
+          maneuvers_have_been_combined = true;
+        } else if (!curr_man->HasStreetNames() && next_next_man->HasStreetNames()) {
+          // No real global turn (artificial chicane), but curr unnamed and next_next named:
+          // merge connector into curr
+          LOG_TRACE(
+              "+++ Combine: artificial chicane connector into previous (unnamed before, named after) +++");
+          next_man = CombineManeuvers(maneuvers, curr_man, next_man);
+          maneuvers_have_been_combined = true;
+        } else {
+          // No real global turn (artificial chicane), but both sides named differently:
+          // always merge connector into next_next
+          LOG_TRACE("+++ Combine: artificial chicane connector into next (name change) +++");
+          // set connector names, trail type, force type kContinue and kKeepStraight
+          next_man->set_street_names(next_next_man->street_names().clone());
+          next_man->set_trail_type(next_next_man->trail_type());
+          next_man->set_type(DirectionsLeg_Maneuver_Type_kContinue);
+          next_man->set_begin_relative_direction(Maneuver::RelativeDirection::kKeepStraight);
+          auto merged_next = CombineManeuvers(maneuvers, next_man, next_next_man);
+          // advance explicitly
+          prev_man = curr_man;
+          curr_man = next_man;
+          next_man = merged_next;
+          maneuvers_have_been_combined = true;
+        }
+      }
+      // Combine an unnamed mergeable walkway into previous if :
+      // - it is short, or
+      // - without significant direction change
+      // Otherwise, do not combine
+      else if (is_mergeable_unnamed_walkway(*next_man, trip_path_)) {
+        const bool short_enough = next_man->length(Options::kilometers) <= kShortUnnamedWalkwayLength;
+        if ((short_enough || !has_significant_direction_change(*next_man))) {
+          LOG_TRACE("+++ Combine: unnamed walkway into previous +++");
+          next_man = CombineManeuvers(maneuvers, curr_man, next_man);
+          maneuvers_have_been_combined = true;
+        } else {
+          LOG_TRACE("+++ Do Not Combine: unnamed walkway not mergeable +++");
+          prev_man = curr_man;
+          curr_man = next_man;
+          ++next_man;
+        }
+      }
+      // Combine an unnamed walkway into next if next is named and continue / keep straight
+      else if (is_mergeable_unnamed_walkway(*curr_man, trip_path_) &&
+               is_named_walkway(*next_man, trip_path_) &&
+               (next_man->begin_relative_direction() == Maneuver::RelativeDirection::kKeepStraight ||
+                next_man->type() == DirectionsLeg_Maneuver_Type_kContinue) &&
+               !next_man->IsDestinationType()) {
+        LOG_TRACE("+++ Combine: unnamed walkway into next +++");
+        curr_man->set_street_names(next_man->street_names().clone());
+        curr_man->set_trail_type(next_man->trail_type());
+        next_man = CombineManeuvers(maneuvers, curr_man, next_man);
+        maneuvers_have_been_combined = true;
+      }
+      // Combined named walkways with same name if there is no significant direction change
+      else if (is_named_walkway(*curr_man, trip_path_) && is_named_walkway(*next_man, trip_path_) &&
+               !has_significant_direction_change(*next_man) &&
+               !curr_man->street_names().FindCommonBaseNames(next_man->street_names())->empty()) {
+        LOG_TRACE("+++ Combine: walkways with same name without significant direction change+++");
+        next_man = CombineManeuvers(maneuvers, curr_man, next_man);
+        maneuvers_have_been_combined = true;
       }
       // Do not combine
       // if travel mode is different
@@ -3192,6 +3359,13 @@ bool ManeuversBuilder::IsNextManeuverObvious(const std::list<Maneuver>& maneuver
   if ((next_man->type() == DirectionsLeg_Maneuver_Type_kContinue)) {
     // Get the node between the the current and next maneuver
     auto node = trip_path_->GetEnhancedNode(next_man->begin_node_index());
+
+    // Return false if 2 walkway with conflicting base name
+    if (is_walkway_large_use(*curr_man, trip_path_) && is_walkway_large_use(*next_man, trip_path_) &&
+        curr_man->HasStreetNames() && next_man->HasStreetNames() &&
+        curr_man->street_names().FindCommonBaseNames(next_man->street_names())->empty()) {
+      return false;
+    }
 
     // Return true if there are no traversable intersecting edges
     if (node && !node->HasTraversableIntersectingEdge(next_man->travel_mode())) {

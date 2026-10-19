@@ -42,15 +42,15 @@ constexpr unsigned int kMaxSamplePointsToTest = 100;
 constexpr unsigned long kMaxEnrichDistance = 50;
 
 // Minimum pedestrian edge length (in meters) to enrich. Very short fragments (e.g. the
-// 1-3 m connectors flanking a pedestrian crossing) sit right next to the perpendicular
+// 1-6 m connectors flanking a pedestrian crossing) sit right next to the perpendicular
 // street they meet, so a single static name is ambiguous and misleading. Leaving them
 // unnamed lets Odin adopt the continuing street's name when it builds the maneuver.
-constexpr uint32_t kMinEnrichLengthMeters = 5;
+constexpr uint32_t kMinEnrichLengthMeters = 6;
 
 // Maximum ratio by which the best street must beat the runner-up for the
 // match to be considered unambiguous. If two different streets score almost the same,
 // picking one is a coin-flip and misleading, so we leave the edge unnamed.
-constexpr float kMaxScoreRatio = 0.5f;
+constexpr float kMaxScoreRatio = 0.75f;
 
 // R-tree types for spatial indexing of named edges
 // We use cartesian coordinates instead geographical because it is clearly faster.
@@ -222,6 +222,22 @@ NamedEdgesTree BuildNamedEdgesTree(GraphReader& reader,
   return tree;
 }
 
+float Direction_difference_penalization_factor(const std::vector<PointLL>& from,
+                                               const std::vector<PointLL>& to) {
+  double heading_from = from.front().Heading(from.back());
+  double heading_to = to.front().Heading(to.back());
+
+  // compute smallest angle between two undirected directions, in [0°, 90°].
+  const double diff = std::abs(heading_from - heading_to);
+  const double diff_0_90 = std::min(std::fmod(diff, 180.), 180. - std::fmod(diff, 180.));
+
+  // a big angle is not relevant
+  if (std::abs(diff_0_90) > 75.)
+    return 100.;
+
+  return 1. + std::tan(diff_0_90 * kRadPerDegD);
+}
+
 // Computes a length-weighted average distance (in meters) from polyline 'from' to a set
 // of polylines 'tos'. Each vertex of 'from' is projected onto the NEAREST of all 'tos',
 // and every segment contributes the mean of its two endpoint distances, weighted by its
@@ -267,7 +283,8 @@ float AverageDistanceToPolylines(const std::vector<PointLL>& from,
       if (to->empty())
         continue;
       vertex_dist[i] =
-          std::min(vertex_dist[i], static_cast<float>(std::get<1>(from[i].ClosestPoint(*to))));
+          std::min(vertex_dist[i], Direction_difference_penalization_factor(from, *to) *
+                                       static_cast<float>(std::get<1>(from[i].ClosestPoint(*to))));
     }
   }
 
@@ -384,7 +401,7 @@ PedestrianTargets CollectPedestrianTargets(const graph_tile_ptr& tile) {
 
     // skip very short fragments: their nearest named road is ambiguous, so we leave them unnamed and
     // let Odin infer the correct name from the continuing edge
-    if (edge->length() < kMinEnrichLengthMeters)
+    if (edge->length() <= kMinEnrichLengthMeters)
       continue;
 
     auto edge_info = tile->edgeinfo(edge);
