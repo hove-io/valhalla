@@ -133,6 +133,45 @@ int normalize_degree(int d) {
   return ((d + 540) % 360) - 180;
 }
 
+// Returns true if `man` can be safely erased by a merge without breaking
+// structural invariants relied upon downstream (destination maneuver,
+// roundabout processing in ProcessRoundabouts, transit connection chains)
+// and without swallowing a relevant instruction the user must hear at a precise point.
+bool is_safe_to_erase(const Maneuver& man) {
+  return !man.IsDestinationType() && !man.roundabout() && !man.transit_connection() &&
+         !man.IsTransit() && !man.elevator() && !man.indoor_steps() && !man.is_steps() &&
+         !man.escalator() && !man.building_enter() && !man.building_exit() && !man.ferry() &&
+         !man.rail_ferry() && !man.fork() && !man.tee() && !man.ramp() && !man.turn_channel() &&
+         !man.intersecting_forward_edge() && !man.traffic_signal() && !man.has_node_type() &&
+         !man.HasSigns() && man.type() != valhalla::DirectionsLeg_Maneuver_Type_kRoundaboutExit &&
+         man.type() != valhalla::DirectionsLeg_Maneuver_Type_kRoundaboutEnter &&
+         man.type() != valhalla::DirectionsLeg_Maneuver_Type_kTransitConnectionDestination;
+}
+
+// Propagates narrative flags from an erased maneuver onto the surviving one.
+// Call this right after CombineManeuvers() when merging next_next into the
+// survivor maneuver, so no guidance information is lost.
+void propagate_erased_maneuver_flags(Maneuver& survivor, const Maneuver& erased) {
+  if (erased.is_bridge()) {
+    survivor.set_bridge(true);
+  }
+  if (erased.is_tunnel()) {
+    survivor.set_tunnel(true);
+  }
+  if (erased.to_stay_on()) {
+    survivor.set_to_stay_on(true);
+  }
+  if (erased.imminent_verbal_multi_cue()) {
+    survivor.set_imminent_verbal_multi_cue(true);
+  }
+  if (erased.distant_verbal_multi_cue()) {
+    survivor.set_distant_verbal_multi_cue(true);
+  }
+  survivor.set_internal_right_turn_count(survivor.internal_right_turn_count() +
+                                         erased.internal_right_turn_count());
+  survivor.set_internal_left_turn_count(survivor.internal_left_turn_count() +
+                                        erased.internal_left_turn_count());
+}
 } // namespace
 
 namespace valhalla {
@@ -509,9 +548,11 @@ void ManeuversBuilder::Combine(std::list<Maneuver>& maneuvers) {
       // - connector in curr_man, or
       // - next_next in connector, or
       // - combine all
+      // Only the 2 last cases need to check if next_next is safe to erase, but we also check it
+      // even if connector is supposed to merge in curr_man, for simplicity
       else if (next_man != maneuvers.end() &&
                is_short_mergeable_pedestrian_connector(*next_man, trip_path_) &&
-               std::next(next_man) != maneuvers.end()) {
+               std::next(next_man) != maneuvers.end() && is_safe_to_erase(*std::next(next_man))) {
 
         auto next_next_man = std::next(next_man);
 
@@ -543,6 +584,7 @@ void ManeuversBuilder::Combine(std::list<Maneuver>& maneuvers) {
               next_man->set_street_names(next_next_man->street_names().clone());
               next_man->set_trail_type(next_next_man->trail_type());
             }
+            propagate_erased_maneuver_flags(*next_man, *next_next_man);
             auto merged_next = CombineManeuvers(maneuvers, next_man, next_next_man);
             // advance explicitly: the merged maneuver is the old next_man
             prev_man = curr_man;
@@ -556,6 +598,7 @@ void ManeuversBuilder::Combine(std::list<Maneuver>& maneuvers) {
           LOG_TRACE("+++ Combine: artificial chicane connector, merge all +++");
           next_man = CombineManeuvers(maneuvers, curr_man, next_man); // connector into curr
           // now, next_man is on next_next
+          propagate_erased_maneuver_flags(*curr_man, *next_man);
           next_man = CombineManeuvers(maneuvers, curr_man, next_man); // next_next into curr
           maneuvers_have_been_combined = true;
         } else if (!curr_man->HasStreetNames() && next_next_man->HasStreetNames()) {
@@ -574,6 +617,7 @@ void ManeuversBuilder::Combine(std::list<Maneuver>& maneuvers) {
           next_man->set_trail_type(next_next_man->trail_type());
           next_man->set_type(DirectionsLeg_Maneuver_Type_kContinue);
           next_man->set_begin_relative_direction(Maneuver::RelativeDirection::kKeepStraight);
+          propagate_erased_maneuver_flags(*curr_man, *next_man);
           auto merged_next = CombineManeuvers(maneuvers, next_man, next_next_man);
           // advance explicitly
           prev_man = curr_man;
