@@ -38,8 +38,8 @@ constexpr double kSampleStepMeters = 10.0;
 // and then deduplicate to obtain up to distinct edges.
 constexpr unsigned int kMaxSamplePointsToTest = 100;
 
-// Maximum search distance in meters between a named road and a sidewalk
-constexpr unsigned long kMaxEnrichDistance = 50;
+// Maximum search scored distance between a named road and a sidewalk
+constexpr unsigned long kMaxEnrichScoredDistance = 50;
 
 // Minimum pedestrian edge length (in meters) to enrich. Very short fragments (e.g. the
 // 1-6 m connectors flanking a pedestrian crossing) sit right next to the perpendicular
@@ -67,11 +67,7 @@ bool IsCandidateUseForName(Use use) {
     case Use::kRamp:
     case Use::kTurnChannel:
     case Use::kTrack:
-    case Use::kDriveway:
     case Use::kAlley:
-    case Use::kParkingAisle:
-    case Use::kEmergencyAccess:
-    case Use::kDriveThru:
     case Use::kCuldesac:
     case Use::kLivingStreet:
     case Use::kServiceRoad:
@@ -84,10 +80,23 @@ bool IsCandidateUseForName(Use use) {
   }
 }
 
+bool HasPriority(const DirectedEdge* edge) {
+  switch (edge->use()) {
+    case Use::kRoad:
+    case Use::kCuldesac:
+    case Use::kLivingStreet:
+    case Use::kPedestrian:
+      return true;
+    default:
+      return edge->sidewalk_left() || edge->sidewalk_right();
+  }
+}
+
 // Stores the name and full geometry needed to score one road candidate.
 struct NamedEdgeCandidate {
   std::string name;
   std::vector<PointLL> shape;
+  bool priority;
 };
 
 // R-tree struct with associated candidates
@@ -209,6 +218,7 @@ NamedEdgesTree BuildNamedEdgesTree(GraphReader& reader,
       tree.candidates.push_back({
           names.front(),
           candidate_shape,
+          HasPriority(candidate_directed_edge),
       });
     }
   }
@@ -309,10 +319,10 @@ float AverageDistanceToPolylines(const std::vector<PointLL>& from,
 // sampled points in the R-tree. Candidate road edges are deduplicated and grouped by
 // name (a street is often split into several edges), then each street is scored against
 // the pedestrian edge with the length-weighted polyline distance; the closest one wins.
-std::string FindNearestName(const NamedEdgesTree& tree,
-                            const std::vector<PointLL>& pedestrian_shape,
-                            std::vector<rtree_value_t>& results,
-                            const float cos_lat) {
+std::string FindBestName(const NamedEdgesTree& tree,
+                         const std::vector<PointLL>& pedestrian_shape,
+                         std::vector<rtree_value_t>& results,
+                         const float cos_lat) {
   PointLL center = PolylineMidpoint(pedestrian_shape);
   results.clear(); // clear content but memory is kept
 
@@ -327,10 +337,11 @@ std::string FindNearestName(const NamedEdgesTree& tree,
                                                    kMaxSamplePointsToTest),
                    std::back_inserter(results));
 
-  // group distinct candidates by street name; several samples may map to the
-  // same candidate, and several candidates may share the same street name
+  // group distinct candidates by street name into priority and fallback maps; several samples may
+  // map to the same candidate, and several candidates may share the same street name
   std::set<uint32_t> tested_candidates;
-  std::map<std::string, std::vector<const std::vector<PointLL>*>> shapes_by_name;
+  std::map<std::string, std::vector<const std::vector<PointLL>*>> shapes_by_priority_name;
+  std::map<std::string, std::vector<const std::vector<PointLL>*>> shapes_by_fallback_name;
   for (const auto& [pt, candidate_idx] : results) {
     // already grouped this edge through another sample point
     if (tested_candidates.count(candidate_idx))
@@ -338,34 +349,54 @@ std::string FindNearestName(const NamedEdgesTree& tree,
     tested_candidates.insert(candidate_idx);
 
     const auto& candidate = tree.candidates[candidate_idx];
-    shapes_by_name[candidate.name].push_back(&candidate.shape);
+    if (candidate.priority)
+      shapes_by_priority_name[candidate.name].push_back(&candidate.shape);
+    else
+      shapes_by_fallback_name[candidate.name].push_back(&candidate.shape);
   }
 
-  // the street name with the best aggregated score wins; we also track the runner-up
-  // to reject ambiguous matches
-  float best_score = std::numeric_limits<float>::max();
-  float second_score = std::numeric_limits<float>::max();
-  std::string best_name;
-  for (const auto& [name, shapes] : shapes_by_name) {
-    float score = AverageDistanceToPolylines(sampled_pedestrian, shapes);
-    if (score < best_score) {
-      second_score = best_score;
-      best_score = score;
-      best_name = name;
-    } else if (score < second_score) {
-      second_score = score;
+  enum class PickResult : std::uint8_t {
+    kOk,
+    kTooFar,
+    kAmbiguous,
+  };
+
+  // score a priority map; returns a PickResult + the winning name
+  auto pick_best =
+      [&](const std::map<std::string, std::vector<const std::vector<PointLL>*>>& shape_by_name)
+      -> std::pair<PickResult, std::string> {
+    // the street name with the best score wins; we also track the runner-up
+    // to reject ambiguous matches
+    float best_score = std::numeric_limits<float>::max();
+    float second_score = std::numeric_limits<float>::max();
+    std::string best_name;
+    for (const auto& [name, shapes] : shape_by_name) {
+      float score = AverageDistanceToPolylines(sampled_pedestrian, shapes);
+      if (score < best_score) {
+        second_score = best_score;
+        best_score = score;
+        best_name = name;
+      } else if (score < second_score) {
+        second_score = score;
+      }
     }
-  }
+    if (best_score > kMaxEnrichScoredDistance)
+      return {PickResult::kTooFar, {}};
+    if (best_score > kMaxScoreRatio * second_score)
+      return {PickResult::kAmbiguous, {}};
+    else
+      return {PickResult::kOk, best_name};
+  };
 
-  // too far: no usable name
-  if (best_score > kMaxEnrichDistance)
+  // priority level first; fallback only if priority name are too far
+  auto [res, name] = pick_best(shapes_by_priority_name);
+  if (res == PickResult::kOk)
+    return name;
+  if (res == PickResult::kAmbiguous) // ambiguous: the runner-up street is almost as close, so naming
+                                     // is misleading
     return {};
-
-  // ambiguous: the runner-up street is almost as close, so naming is misleading
-  if (best_score > kMaxScoreRatio * second_score)
-    return {};
-
-  return best_name; // can be empty if all tested streets are > kMaxEnrichDistance or ambiguous
+  else                                                // to far
+    return pick_best(shapes_by_fallback_name).second; // can be empty
 }
 
 // Unit pedestrian enrichment of an edge
@@ -474,7 +505,8 @@ void EnrichWorker(const boost::property_tree::ptree& pt,
         continue;
 
       // expand by the maximum accepted distance to include nearby named-road candidates
-      const auto candidate_bb = ExpandMeters(*targets.bounding_box, kMaxEnrichDistance);
+      // the real distance is always lower than the scored distance, so the bounding box is larger
+      const auto candidate_bb = ExpandMeters(*targets.bounding_box, kMaxEnrichScoredDistance);
       // expand by one sample step to retain samples around the candidate-area boundary
       const auto sample_bb = ExpandMeters(candidate_bb, kSampleStepMeters);
 
@@ -512,7 +544,7 @@ void EnrichWorker(const boost::property_tree::ptree& pt,
           continue;
         }
 
-        auto name = FindNearestName(tree, shape, results, cos_lat);
+        auto name = FindBestName(tree, shape, results, cos_lat);
 
         if (!results.empty())
           ++queries_with_results;
