@@ -141,9 +141,9 @@ bool is_safe_to_erase(const Maneuver& man) {
   return !man.IsDestinationType() && !man.roundabout() && !man.transit_connection() &&
          !man.IsTransit() && !man.elevator() && !man.indoor_steps() && !man.is_steps() &&
          !man.escalator() && !man.building_enter() && !man.building_exit() && !man.ferry() &&
-         !man.rail_ferry() && !man.ramp() && !man.turn_channel() &&
-         !man.intersecting_forward_edge() && !man.traffic_signal() && !man.has_node_type() &&
-         !man.HasSigns() && man.type() != valhalla::DirectionsLeg_Maneuver_Type_kRoundaboutExit &&
+         !man.rail_ferry() && !man.ramp() && !man.turn_channel() && !man.traffic_signal() &&
+         !man.has_node_type() && !man.HasSigns() &&
+         man.type() != valhalla::DirectionsLeg_Maneuver_Type_kRoundaboutExit &&
          man.type() != valhalla::DirectionsLeg_Maneuver_Type_kRoundaboutEnter &&
          man.type() != valhalla::DirectionsLeg_Maneuver_Type_kTransitConnectionDestination;
 }
